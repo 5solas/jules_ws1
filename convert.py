@@ -10,6 +10,7 @@
 import subprocess
 import sys
 import os
+import re
 from pathlib import Path
 from typing import List, Optional, Tuple
 import typer
@@ -102,14 +103,25 @@ def main(
     path: Path = typer.Argument(..., help="Target directory to scan for git repositories"),
     find: str = typer.Option(None, help="String to find in the origin URL"),
     replace: str = typer.Option(None, help="String to replace with"),
+    regex: bool = typer.Option(False, "--regex", "-r", help="Enable regex matching. Supports backreferences (e.g. \\1) in replace string."),
     batch: bool = typer.Option(False, "--batch", "-b", help="Run in batch mode without interactive confirmation"),
 ):
     """
     Scans for git repositories in the given PATH and updates their origin URL.
+
+    Examples of Regex usage:
+      --find "github\\.com" --replace "gitlab.com" --regex
+      --find "server-(\\d+)" --replace "host-\\1" --regex
     """
     if not path.exists():
         console.print(f"[red]Path '{path}' does not exist.[/red]")
         raise typer.Exit(code=1)
+
+    # Input cleaning (if provided via args)
+    if find:
+        find = find.strip()
+    if replace:
+        replace = replace.strip()
 
     repos = find_git_repos(path)
 
@@ -152,8 +164,13 @@ def main(
     # Inputs for Find/Replace
     if find is None:
         find = questionary.text("Enter text to find in Origin URL (e.g., github.com):").ask()
+        if find:
+            find = find.strip()
+
     if replace is None:
         replace = questionary.text("Enter replacement text (e.g., gitlab.com):").ask()
+        if replace:
+            replace = replace.strip()
 
     # Handle cancellation of prompts
     if find is None or replace is None:
@@ -166,7 +183,10 @@ def main(
 
     # Confirm
     if not batch:
-        if not questionary.confirm(f"Ready to process {len(selected_repos)} repositories. Proceed?").ask():
+        msg = f"Ready to process {len(selected_repos)} repositories. Proceed?"
+        if regex:
+            msg += " (Regex Mode Enabled)"
+        if not questionary.confirm(msg).ask():
             console.print("Operation cancelled.")
             raise typer.Exit()
 
@@ -192,12 +212,43 @@ def main(
         current_url = stdout.strip()
         console.print(f"  Current Origin: {current_url}")
 
-        if find not in current_url:
-            console.print(f"  [yellow]Skipping:[/yellow] '{find}' not found in URL.")
-            skip_count += 1
-            continue
+        new_url = current_url # Default value
 
-        new_url = current_url.replace(find, replace)
+        if regex:
+            try:
+                if re.search(find, current_url):
+                    new_url = re.sub(find, replace, current_url)
+                else:
+                    console.print(f"  [yellow]Skipping:[/yellow] Regex '{find}' not found in URL.")
+                    skip_count += 1
+                    continue
+            except re.error as e:
+                console.print(f"  [red]Regex Error:[/red] {e}")
+                fail_count += 1
+                continue
+        else:
+            # String mode with robust slash handling
+            match_found = False
+            target_find = find
+
+            if find in current_url:
+                match_found = True
+            elif find.endswith('/') and find.rstrip('/') in current_url:
+                # Handle user inputting 'repo/' but url is 'repo'
+                # Prevent matching empty string if find is just "/"
+                stripped = find.rstrip('/')
+                if stripped:
+                    match_found = True
+                    target_find = stripped
+                    console.print(f"  [blue]Info:[/blue] Matched stripped version '{target_find}'")
+
+            if not match_found:
+                console.print(f"  [yellow]Skipping:[/yellow] '{find}' not found in URL.")
+                skip_count += 1
+                continue
+
+            new_url = current_url.replace(target_find, replace)
+
         console.print(f"  New Origin:     {new_url}")
 
         if new_url == current_url:
