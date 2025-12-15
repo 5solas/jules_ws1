@@ -43,7 +43,6 @@ def run_command(cmd: List[str], cwd: Optional[Path] = None, capture: bool = True
     """
     try:
         # On Windows, we might need shell=True for some commands, but usually not for list-based args.
-        # However, finding executables like 'fd' might rely on PATH.
         result = subprocess.run(
             cmd,
             cwd=cwd,
@@ -61,6 +60,7 @@ def run_command(cmd: List[str], cwd: Optional[Path] = None, capture: bool = True
 def find_git_repos(root_path: Path) -> List[Path]:
     """
     Finds git repositories using 'fd' or falls back to os.walk.
+    Detects standard repos, worktrees, and submodules.
     """
     # Check if fd is installed
     code, _, _ = run_command(["fd", "--version"])
@@ -69,9 +69,9 @@ def find_git_repos(root_path: Path) -> List[Path]:
 
     if code == 0:
         console.print(f"[green]Scanning {root_path} using fd...[/green]")
-        # fd -H (hidden) -I (no-ignore) -t d (type directory) "^.git$" (name regex) <root_path>
-        # We look for the .git folder itself to be sure.
-        cmd = ["fd", "-H", "-I", "-t", "d", "^.git$", str(root_path)]
+        # fd -H (hidden) -I (no-ignore) "^.git$" (name regex) <root_path>
+        # This will find both .git directories and .git files
+        cmd = ["fd", "-H", "-I", "^.git$", str(root_path)]
         code, stdout, stderr = run_command(cmd)
 
         if code != 0:
@@ -80,23 +80,47 @@ def find_git_repos(root_path: Path) -> List[Path]:
         else:
             lines = stdout.strip().splitlines()
             for line in lines:
-                git_dir = Path(line.strip())
-                repos.append(git_dir.parent)
+                git_item = Path(line.strip())
+                repos.append(git_item.parent)
             return repos
 
     if code != 0:
         console.print("[yellow]fd not found or failed. Using standard os.walk (this might be slower)...[/yellow]")
 
     for dirpath, dirnames, filenames in os.walk(root_path):
+        # Check for .git directory
         if ".git" in dirnames:
             repos.append(Path(dirpath))
             # Don't recurse into .git
-            # Also, usually we don't need to look inside a git repo for other git repos (submodules are handled differently)
-            # But let's just avoid entering .git
-            if ".git" in dirnames:
-                dirnames.remove(".git")
+            dirnames.remove(".git")
+        # Check for .git file (worktree or submodule)
+        elif ".git" in filenames:
+            repos.append(Path(dirpath))
 
     return repos
+
+def get_new_url(current_url: str, find: str, replace: str, regex: bool) -> Optional[str]:
+    """
+    Calculates the new URL based on find/replace logic.
+    Returns None if no change is needed or match not found.
+    """
+    if regex:
+        try:
+            if re.search(find, current_url):
+                return re.sub(find, replace, current_url)
+        except re.error as e:
+            console.print(f"[red]Regex Error:[/red] {e}")
+            return None
+    else:
+        # String mode with robust slash handling
+        if find in current_url:
+            return current_url.replace(find, replace)
+        elif find.endswith('/') and find.rstrip('/') in current_url:
+            # Handle user inputting 'repo/' but url is 'repo'
+            stripped = find.rstrip('/')
+            if stripped:
+                return current_url.replace(stripped, replace)
+    return None
 
 @app.command()
 def main(
@@ -107,7 +131,8 @@ def main(
     batch: bool = typer.Option(False, "--batch", "-b", help="Run in batch mode without interactive confirmation"),
 ):
     """
-    Scans for git repositories in the given PATH and updates their origin URL.
+    Scans for git repositories (including worktrees and submodules) in the given PATH and updates their origin URL.
+    Also updates .gitmodules and .git/config submodule URLs.
 
     Examples of Regex usage:
       --find "github\\.com" --replace "gitlab.com" --regex
@@ -134,6 +159,9 @@ def main(
         display_repos = [r.resolve() for r in repos]
     except Exception:
         display_repos = repos
+
+    # Deduplicate
+    display_repos = sorted(list(set(display_repos)))
 
     console.print(f"Found {len(display_repos)} repositories.")
 
@@ -195,86 +223,78 @@ def main(
     fail_count = 0
     skip_count = 0
 
-    # Using track for progress bar
-    # We iterate over selected_repos
-
-    # We explicitly convert generator to list for track if needed, but it's already a list.
     for repo in track(selected_repos, description="Processing repositories..."):
         console.print(f"\n[bold blue]repo:[/bold blue] {repo}")
 
-        # Get current URL
+        # 1. Update Origin
         code, stdout, stderr = run_command(["git", "remote", "get-url", "origin"], cwd=repo)
+
+        # If the command failed, it might not be a repo (e.g. invalid state), or no remote named origin
         if code != 0:
-            console.print(f"  [red]Failed to get origin:[/red] {stderr.strip()}")
-            fail_count += 1
-            continue
+             console.print(f"  [yellow]Skipping origin update:[/yellow] {stderr.strip()}")
+        else:
+            current_url = stdout.strip()
+            console.print(f"  Current Origin: {current_url}")
+            new_url = get_new_url(current_url, find, replace, regex)
 
-        current_url = stdout.strip()
-        console.print(f"  Current Origin: {current_url}")
-
-        new_url = current_url # Default value
-
-        if regex:
-            try:
-                if re.search(find, current_url):
-                    new_url = re.sub(find, replace, current_url)
+            if new_url and new_url != current_url:
+                console.print(f"  New Origin:     {new_url}")
+                # Set URL
+                code, stdout, stderr = run_command(["git", "remote", "set-url", "origin", new_url], cwd=repo)
+                if code != 0:
+                    console.print(f"  [red]Failed to set origin:[/red] {stderr.strip()}")
+                    fail_count += 1
                 else:
-                    console.print(f"  [yellow]Skipping:[/yellow] Regex '{find}' not found in URL.")
-                    skip_count += 1
-                    continue
-            except re.error as e:
-                console.print(f"  [red]Regex Error:[/red] {e}")
-                fail_count += 1
-                continue
-        else:
-            # String mode with robust slash handling
-            match_found = False
-            target_find = find
+                    # Fetch
+                    console.print("  Fetching...")
+                    code, stdout, stderr = run_command(["git", "fetch", "origin"], cwd=repo)
+                    if code != 0:
+                        console.print(f"  [red]Fetch failed:[/red] {stderr.strip()}")
+                        console.print("  [red]The origin was changed, but fetch failed. Please check the URL.[/red]")
+                        # We still count this as a success for the URL update itself
+                        success_count += 1
+                    else:
+                        console.print("  [green]Success![/green]")
+                        success_count += 1
+            else:
+                 console.print(f"  [yellow]Skipping:[/yellow] URL unchanged or pattern not found.")
+                 skip_count += 1
 
-            if find in current_url:
-                match_found = True
-            elif find.endswith('/') and find.rstrip('/') in current_url:
-                # Handle user inputting 'repo/' but url is 'repo'
-                # Prevent matching empty string if find is just "/"
-                stripped = find.rstrip('/')
-                if stripped:
-                    match_found = True
-                    target_find = stripped
-                    console.print(f"  [blue]Info:[/blue] Matched stripped version '{target_find}'")
+        # 2. Update Submodules (.gitmodules and .git/config)
+        gitmodules_path = repo / ".gitmodules"
+        if gitmodules_path.exists():
+            console.print("  [blue]Checking .gitmodules...[/blue]")
+            # Get submodule URLs
+            code, stdout, stderr = run_command(["git", "config", "-f", ".gitmodules", "--get-regexp", "submodule\\..*\\.url"], cwd=repo)
 
-            if not match_found:
-                console.print(f"  [yellow]Skipping:[/yellow] '{find}' not found in URL.")
-                skip_count += 1
-                continue
+            submodule_changes = False
+            if code == 0:
+                lines = stdout.strip().splitlines()
+                for line in lines:
+                    parts = line.split(" ", 1)
+                    if len(parts) != 2: continue
+                    key, url = parts
 
-            new_url = current_url.replace(target_find, replace)
+                    new_sub_url = get_new_url(url, find, replace, regex)
+                    if new_sub_url and new_sub_url != url:
+                         console.print(f"    Updating submodule '{key}':")
+                         console.print(f"      Old: {url}")
+                         console.print(f"      New: {new_sub_url}")
 
-        console.print(f"  New Origin:     {new_url}")
+                         # Update .gitmodules
+                         run_command(["git", "config", "-f", ".gitmodules", key, new_sub_url], cwd=repo)
 
-        if new_url == current_url:
-             console.print(f"  [yellow]Skipping:[/yellow] URL unchanged.")
-             skip_count += 1
-             continue
+                         # Update .git/config
+                         run_command(["git", "config", key, new_sub_url], cwd=repo)
 
-        # Set URL
-        code, stdout, stderr = run_command(["git", "remote", "set-url", "origin", new_url], cwd=repo)
-        if code != 0:
-            console.print(f"  [red]Failed to set origin:[/red] {stderr.strip()}")
-            fail_count += 1
-            continue
+                         submodule_changes = True
 
-        # Fetch
-        console.print("  Fetching...")
-        code, stdout, stderr = run_command(["git", "fetch", "origin"], cwd=repo)
-        if code != 0:
-            console.print(f"  [red]Fetch failed:[/red] {stderr.strip()}")
-            console.print("  [red]The origin was changed, but fetch failed. Please check the URL.[/red]")
-            fail_count += 1
-        else:
-            console.print("  [green]Success![/green]")
-            success_count += 1
+            if submodule_changes:
+                console.print("    Syncing submodules...")
+                run_command(["git", "submodule", "sync"], cwd=repo)
+                console.print("    [green]Submodules synced.[/green]")
 
-    console.print(f"\n[bold]Done.[/bold] Success: {success_count}, Failed: {fail_count}, Skipped: {skip_count}")
+    console.print(f"\n[bold]Done.[/bold] Origin Updates - Success: {success_count}, Failed: {fail_count}, Skipped: {skip_count}")
 
 if __name__ == "__main__":
     app()
